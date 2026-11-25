@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Gold AI Analyst</title><meta name="color-scheme" content="dark">
+<style>
+:root{--bg:#0b0a14;--card:#12101f;--tx:#e6e3f5;--dim:#8a85a8;--g:#22c55e;--r:#ef4444;--y:#eab308;--p:#a78bfa}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px ui-monospace,Menlo,monospace;padding:max(12px,env(safe-area-inset-top)) 12px 40px}
+.c{background:var(--card);border:1px solid #2a2542;border-radius:14px;padding:14px;margin:0 auto 12px;max-width:520px}
+.big{font-size:44px;font-weight:700;text-align:center;letter-spacing:4px}.buy{color:var(--g)}.sell{color:var(--r)}.wait{color:var(--y)}
+.s{text-align:center;color:var(--dim);font-size:12px;margin:4px 0}
+.row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid #231f3a}
+.l{color:var(--dim);font-size:11px;letter-spacing:2px}.v{font-size:18px;font-weight:700}
+.tp{border-left:3px solid var(--g);background:#0d1a17;border-radius:8px;padding:8px 10px;margin:8px 0;display:flex;justify-content:space-between}
+.tp.hit{opacity:.55}.pill{display:inline-block;padding:4px 12px;border:1px solid;border-radius:20px;font-size:12px}
+.t{background:#2a2000;border:1px solid #6b5300;color:var(--y);padding:10px;border-radius:10px;text-align:center;margin-top:8px}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:4px 2px;text-align:left}th{color:var(--dim);font-weight:400}
+.ev{color:var(--dim);font-size:11px;line-height:1.6}button{background:none;color:var(--dim);border:1px solid #2a2542;border-radius:8px;padding:6px 10px;font:inherit;font-size:11px}
+</style></head><body>
+<div id="app" class="c s">Loading market data…</div>
+<script>
+const TF_W={H4:.30,H1:.35,M15:.35},W={ema:.2,struct:.2,bos:.15,sweep:.1,fvg:.1,sr:.1,mom:.15};
+const TP_R=[1.5,2.5,4],THRESH=.3,SESSION=[8.5,20],MAXP=240,COOL=5,STALE=40,KEY="goldbot_state_v1",REQ_ALL=true;
+const clip=(x,a,b)=>Math.max(a,Math.min(b,x)),mean=a=>a.reduce((s,x)=>s+x,0)/a.length,r2=x=>Math.round(x*100)/100;
+const ewm=(x,al)=>{const o=[x[0]];for(let i=1;i<x.length;i++)o.push(al*x[i]+(1-al)*o[i-1]);return o};
+const ema=(x,n)=>ewm(x,2/(n+1));
+function atrS(H,L,C){const tr=H.map((h,i)=>i?Math.max(h-L[i],Math.abs(h-C[i-1]),Math.abs(L[i]-C[i-1])):h-L[i]);return ewm(tr,1/14)}
+function rsi(C){const d=C.slice(1).map((x,i)=>x-C[i]);const u=ewm(d.map(x=>Math.max(x,0)),1/14).at(-1),n=ewm(d.map(x=>Math.max(-x,0)),1/14).at(-1);return 100-100/(1+u/Math.max(n,1e-9))}
+function swings(H,L,k=3){const sh=[],sl=[];for(let i=k;i<H.length-k;i++){let mx=-1e9,mn=1e9;for(let j=i-k;j<=i+k;j++){mx=Math.max(mx,H[j]);mn=Math.min(mn,L[j])}if(H[i]==mx)sh.push([i,H[i]]);if(L[i]==mn)sl.push([i,L[i]])}return[sh,sl]}
+const prox=(d,a)=>d==null?0:Math.max(0,1-d/(1.5*a));
+
+async function bars(range,itv){
+  const r=await fetch(`/.netlify/functions/px?range=${range}&interval=${itv}`);
+  if(!r.ok)throw new Error("data "+r.status);
+  const x=(await r.json()).chart.result[0],q=x.indicators.quote[0],o=[];
+  x.timestamp.forEach((t,i)=>{if([q.open[i],q.high[i],q.low[i],q.close[i]].every(v=>v!=null))o.push({t:t*1000,o:q.open[i],h:q.high[i],l:q.low[i],c:q.close[i]})});
+  return o}
+let H1c=null,H1t=0;
+async function feed(){
+  const m15=await bars("10d","15m");
+  if(!H1c||Date.now()-H1t>120000){H1c=await bars("60d","1h");H1t=Date.now()}
+  const g={};for(const b of H1c){const k=Math.floor(b.t/14400000);const e=g[k];if(!e)g[k]={...b,t:k*14400000};else{e.h=Math.max(e.h,b.h);e.l=Math.min(e.l,b.l);e.c=b.c}}
+  const h4=Object.values(g);if(Math.min(m15.length,H1c.length,h4.length)<60)throw new Error("not enough data");
+  return{M15:m15,H1:H1c,H4:h4}}
+
+function analyze(df){
+  const C=df.map(b=>b.c),H=df.map(b=>b.h),L=df.map(b=>b.l),n=df.length,price=C[n-1];
+  const ats=atrS(H,L,C),a=ats[n-1],e20=ema(C,20)[n-1],e50=ema(C,50)[n-1],[sh,sl]=swings(H,L),sc={};
+  sc.ema=price>e20&&e20>e50?1:price<e20&&e20<e50?-1:.3*Math.sign(price-e50);
+  let trend=0;sc.struct=0;
+  if(sh.length>=2&&sl.length>=2){const hh=sh.at(-1)[1]>sh.at(-2)[1],hl=sl.at(-1)[1]>sl.at(-2)[1];sc.struct=.5*(hh?1:-1)+.5*(hl?1:-1);trend=Math.abs(sc.struct)==1?sc.struct:0}
+  sc.bos=0;{const so=sh.filter(s=>s[0]<n-6),lo=sl.filter(s=>s[0]<n-6);
+    if(so.length&&lo.length){const Hh=so.at(-1)[1],Ll=lo.at(-1)[1],rec=C.slice(-6),mx=Math.max(...rec),mn=Math.min(...rec);let up=mx>Hh,dn=mn<Ll;
+      if(up&&dn){up=rec.indexOf(mx)>rec.indexOf(mn);dn=!up}
+      if(up)sc.bos=trend<0?1:.7;else if(dn)sc.bos=trend>0?-1:-.7}}
+  sc.sweep=0;{const so=sh.filter(s=>s[0]<n-8).slice(-3),lo=sl.filter(s=>s[0]<n-8).slice(-3);
+    for(let k=1;k<=8;k++){const j=n-k;let hit=0;for(const[,v]of so)if(H[j]>v&&C[j]<v)hit=-1;for(const[,v]of lo)if(L[j]<v&&C[j]>v)hit=1;if(hit){sc.sweep=hit*(1-(k-1)/8);break}}}
+  let fb=null,fs=null;
+  for(let i=Math.max(2,n-80);i<n;i++){
+    if(L[i]>H[i-2]){const z=[H[i-2],L[i]];if((i+1>=n||Math.min(...L.slice(i+1))>z[0])&&z[1]<price+.1*a)fb=z}
+    if(H[i]<L[i-2]){const z=[H[i],L[i-2]];if((i+1>=n||Math.max(...H.slice(i+1))<z[1])&&z[0]>price-.1*a)fs=z}}
+  sc.fvg=clip(prox(fb?Math.max(0,price-fb[1]):null,a)-prox(fs?Math.max(0,fs[0]-price):null,a),-1,1);
+  const pts=[...sh,...sl].filter(s=>s[0]>n-150).map(s=>s[1]).sort((x,y)=>x-y),lv=[];let g=[];
+  for(const p of pts){if(g.length&&p-g.at(-1)>.4*a){lv.push(mean(g));g=[]}g.push(p)}if(g.length)lv.push(mean(g));
+  const bl=lv.filter(l=>l<=price),ab=lv.filter(l=>l>price),sup=bl.length?Math.max(...bl):null,res=ab.length?Math.min(...ab):null;
+  sc.sr=clip(prox(sup==null?null:price-sup,a)-prox(res==null?null:res-price,a),-1,1);
+  let m=Math.tanh((price-C[n-11])/a/2);const r=rsi(C);if((r>75&&m>0)||(r<25&&m<0))m*=.5;sc.mom=m;
+  const total=Object.keys(W).reduce((s,k)=>s+W[k]*sc[k],0);
+  return{price,atr:a,sc,total,fb,fs,sup,res,sh,sl,volr:a/mean(ats.slice(-50))}}
+
+function decide(tfs,stale,nw){
+  const tech=Object.keys(TF_W).reduce((s,k)=>s+TF_W[k]*tfs[k].total,0),total=tech+(nw?NEWS_W*nw.score:0),d=total>=0?1:-1;
+  const aligned=Object.values(tfs).filter(t=>Math.sign(t.total)==d&&Math.abs(t.total)>=.15).length,r=[];
+  if(Math.abs(total)<THRESH)r.push(`Score ${total.toFixed(2)} below ±${THRESH}`);
+  if(aligned<(REQ_ALL?3:2))r.push(`Only ${aligned}/3 timeframes aligned`);
+  const t=new Date(),hr=t.getUTCHours()+t.getUTCMinutes()/60;
+  if(SESSION&&!(hr>=SESSION[0]&&hr<SESSION[1]))r.push("Outside London/NY session (08:30–20:00 UTC)");
+  const h4=tfs.H4.total;if(Math.sign(h4)==-d&&Math.abs(h4)>.3)r.push("H4 strongly opposes");
+  const m=tfs.M15;if(m.volr>2.5)r.push("Volatility spike");if(m.atr/m.price<.0004)r.push("Volatility too low");
+  if(nw){if(nw.block)r.push(nw.reason);if(Math.sign(nw.score)==-d&&Math.abs(nw.score)>.5)r.push("News strongly opposes")}
+  if(stale)r.push("Market closed / stale data");
+  return{total,d,side:d>0?"BUY":"SELL",aligned,reasons:r,ok:!r.length}}
+
+function buildPlan(dec,tfs,price){
+  const d=dec.d,m=tfs.M15,h1=tfs.H1,aM=m.atr,aH=h1.atr,org=d<0?h1.sh:h1.sl,end=d<0?h1.sl:h1.sh;
+  if(!org.length||!end.length)return null;
+  let[ei,ep]=end.at(-1);const os=org.filter(s=>s[0]<ei).map(s=>s[1]).slice(-3);if(!os.length)return null;
+  const sp=d<0?Math.max(...os):Math.min(...os);ep=d<0?Math.min(ep,price):Math.max(ep,price);
+  const leg=d*(ep-sp);if(leg<1.5*aH)return null;const fib=r=>ep-d*r*leg;
+  let c=[["Fib0.5",fib(.5)],["Fib0.618",fib(.618)],["Fib0.705",fib(.705)]];
+  for(const[t,nm]of[[m,"M15"],[h1,"H1"]]){const z=d<0?t.fs:t.fb;if(z)c.push([nm+" FVG",(z[0]+z[1])/2]);const lv=d<0?t.res:t.sup;if(lv!=null)c.push([nm+(d<0?" Res":" Sup"),lv])}
+  const[lo,hi]=[fib(.5),fib(.786)].sort((x,y)=>x-y),tol=.3*aM;
+  c=c.filter(([,l])=>lo-tol<=l&&l<=hi+tol&&d*(price-l)>=.25*aM&&d*(price-l)<=2*aH);if(!c.length)return null;
+  const conf=x=>c.filter(o=>Math.abs(x[1]-o[1])<.35*aM).length+(x[0]=="Fib0.618"?.5:0);
+  let best=c[0];for(const x of c)if(conf(x)>conf(best)||(conf(x)==conf(best)&&-d*(price-x[1])>-d*(price-best[1])))best=x;
+  const why=c.filter(x=>Math.abs(x[1]-best[1])<.35*aM).map(x=>x[0]).join("+"),entry=r2(best[1]+d*.1*aM);
+  let risk=d*(entry-(sp-d*.3*aH));if(risk>2*aH)return null;risk=r2(Math.max(risk,.8*aH));
+  return{side:dec.side,d,entry,sl:r2(entry-d*risk),tps:TP_R.map(k=>r2(entry+d*risk*k)),risk,why,atr:aM}}
+
+/* ---------- order manager (saved in this browser) ---------- */
+let st={n:0,o:null,cool:0,last:null,ev:[],stats:{total:0,wins:0,losses:0,cancelled:0,net:0}};
+try{const s=JSON.parse(localStorage.getItem(KEY));if(s)st=s}catch(e){}
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(st))}catch(e){}};
+const ev=m=>{st.ev.push(new Date().toLocaleTimeString().slice(0,5)+"  "+m);st.ev=st.ev.slice(-6)};
+function fin(res,note=""){const o=st.o,p=o.plan;if(res=="CANCELLED")st.stats.cancelled++;else{st.stats.total++;st.stats.net+=o.real;o.real>0?st.stats.wins++:st.stats.losses++}
+  ev(`#${o.id} ${p.side} ${res} ${o.real.toFixed(2)}R ${note}`);st.last=[p.side,p.entry,p.atr];st.cool=Date.now()+COOL*60000;st.o=null}
+function apply(hi,lo,allow,bar,now){
+  const o=st.o,p=o.plan,d=p.d;
+  if(o.status=="PENDING"){
+    const touched=d>0?lo<=p.entry:hi>=p.entry,tp1=d>0?hi>=p.tps[0]:lo<=p.tps[0];
+    if(touched){o.status="FILLED";o.bar=bar;allow=false;ev(`#${o.id} filled @ ${p.entry}`)}
+    else if(tp1){fin("CANCELLED","TP1 without fill");return true}else return false}
+  if(d>0?lo<=p.sl:hi>=p.sl){if(o.hit==0)o.real-=o.rem;fin(o.hit==0?"SL":"BE");return true}
+  if(allow){for(let k=o.hit;k<3;k++)if(d>0?hi>=p.tps[k]:lo<=p.tps[k]){o.real+=TP_R[k]/3;o.rem-=1/3;o.hit=k+1;ev(`#${o.id} TP${k+1} hit`);if(k==0)p.sl=p.entry}
+    if(o.hit==3){fin("TP3");return true}}
+  return false}
+function update(price,dec,pl,stale,m15){
+  const now=Date.now();
+  if(st.o){let done=false;
+    for(const b of m15){if(b.t<=st.o.created)continue;const o=st.o;if(apply(b.h,b.l,o.status=="FILLED"&&o.bar!=null&&b.t>o.bar,b.t,now)){done=true;break}}
+    if(!done)apply(price,price,true,m15.at(-1).t,now)}
+  const o=st.o;
+  if(o){if(o.status=="PENDING"&&(now-o.created)/60000>MAXP)fin("CANCELLED","expired")}
+  else if(pl&&dec.ok&&!stale&&now>=st.cool&&!(st.last&&st.last[0]==pl.side&&Math.abs(st.last[1]-pl.entry)<.5*pl.atr)){
+    st.n++;st.o={id:st.n,plan:pl,score:dec.total,created:now,status:"PENDING",rem:1,real:0,hit:0,bar:null};ev(`#${st.n} ${pl.side} LIMIT @ ${pl.entry} (${pl.why})`)}
+  save()}
+
+/* ---------- NEWS (ForexFactory red USD news + headlines) ---------- */
+const NEWS_W=.15,BLK_B=30,BLK_A=15;
+const BULL=[["rate cut",1],["cut rates",1],["dovish",1],["weak dollar",1],["dollar falls",1],["dollar slips",.8],["dollar weakens",1],["dollar drops",1],["dollar dips",.6],["yields fall",.8],["yields drop",.8],["yields slip",.6],["safe haven",.7],["safe-haven",.7],["geopolitical",.5],["tensions",.4],["war",.4],["gold rises",1],["gold climbs",1],["gold surges",1],["gold jumps",1],["gold gains",.8],["gold rallies",1],["gold edges up",.6],["record high",.5],["weak jobs",.8],["jobless claims rise",.6],["inflation cools",.6],["rate-cut",1],["fed cut",.8]];
+const BEAR=[["rate hike",1],["hawkish",1],["strong dollar",1],["dollar rises",1],["dollar gains",.8],["dollar surges",1],["dollar strengthens",1],["dollar climbs",.8],["yields rise",.8],["yields jump",.8],["yields surge",.8],["yields climb",.6],["gold falls",1],["gold drops",1],["gold slips",.8],["gold slides",1],["gold dips",.6],["gold retreats",.8],["gold tumbles",1],["gold eases",.6],["ceasefire",.5],["easing tensions",.6],["strong jobs",.8],["hot inflation",.6],["risk-on",.4],["fed hike",.8]];
+const HB=["cpi","ppi","pce","non-farm","nonfarm","employment change","adp","average hourly","gdp","retail sales","ism","pmi","durable goods","consumer confidence","consumer sentiment","jolts","job openings","federal funds rate","interest rate","cash rate","employment cost"];
+const HU=["unemployment rate","unemployment claims","jobless claims"];
+function parseNum(x){if(x==null)return null;const t=String(x).replace(/,/g,"").trim(),m=t.match(/-?\d+(?:\.\d+)?/);if(!m)return null;const sf=(t[m.index+m[0].length]||"").toUpperCase();return +m[0]*({K:1e3,M:1e6,B:1e9,T:1e12}[sf]||1)}
+function eventBias(e){
+  const t=e.title.toLowerCase(),pol=HU.some(k=>t.includes(k))?1:HB.some(k=>t.includes(k))?-1:0;
+  const a=parseNum(e.actual),f=parseNum(e.forecast),p=parseNum(e.previous);
+  if(!pol)return[0,"VOLATILE","direction depends on tone"];
+  if(a!=null&&f!=null&&a!=f){const s=pol*Math.sign(a-f)*.9;return[s,s>0?"BULLISH":"BEARISH",`actual ${e.actual} vs forecast ${e.forecast}`]}
+  if(f!=null&&p!=null&&f!=p){const rel=Math.abs(f-p)/Math.max(Math.abs(f),Math.abs(p),1e-9),s=pol*Math.sign(f-p)*clip(.3+rel,.3,1)*.6;return[s,s>0?"BULLISH":"BEARISH",`forecast ${e.forecast} vs prev ${e.previous}`]}
+  return[0,"VOLATILE","surprise decides"]}
+const headScore=t=>{t=t.toLowerCase();return clip(BULL.reduce((s,[k,w])=>s+(t.includes(k)?w:0),0)-BEAR.reduce((s,[k,w])=>s+(t.includes(k)?w:0),0),-1,1)};
+let NW={t:0,c:0,heads:[],events:[],status:"connecting"};
+async function news(){
+  const now=Date.now();
+  if(now-NW.t>300000){NW.t=now;try{const r=await fetch("/.netlify/functions/news?src=rss");if(!r.ok)throw 0;const x=new DOMParser().parseFromString(await r.text(),"text/xml");
+    NW.heads=[...x.querySelectorAll("item")].map(i=>[i.querySelector("title")?.textContent||"",new Date(i.querySelector("pubDate")?.textContent).getTime()]);NW.status="ok"}
+    catch(e){NW.status=NW.heads.length?"ok (cached)":"headlines offline"}}
+  if(now-NW.c>1800000){NW.c=now;try{const r=await fetch("/.netlify/functions/news?src=cal");if(!r.ok)throw 0;
+    NW.events=(await r.json()).filter(e=>e.country=="USD"&&e.impact=="High").map(e=>({title:e.title,dt:new Date(e.date).getTime(),forecast:e.forecast,previous:e.previous,actual:e.actual}))}catch(e){}}
+  let tot=0;const sc=[];
+  for(const[title,pub]of NW.heads){const age=(now-pub)/36e5;if(!(age<=24&&age>=-1))continue;const s=headScore(title),w=.5**(Math.max(age,0)/6);tot+=s*w;if(s)sc.push([Math.abs(s*w),title.replace(/ - [^-]*$/,""),s])}
+  sc.sort((a,b)=>b[0]-a[0]);const sent=Math.tanh(tot/3);
+  let block=false,reason="",calSum=0;const today=[],td=new Date().toDateString();
+  for(const e of NW.events.slice().sort((a,b)=>a.dt-b.dt)){
+    const mins=(e.dt-now)/60000,[s,label,why]=eventBias(e);
+    if(new Date(e.dt).toDateString()==td){today.push({title:e.title,time:new Date(e.dt).toTimeString().slice(0,5),mins,fc:e.forecast,prev:e.previous,s,label,why});calSum+=s*(mins>-15?1:mins>-120?.5:.2)}
+    if(mins>=-BLK_A&&mins<=BLK_B){block=true;reason=`Red news: ${e.title} `+(mins>=0?`in ${Math.round(mins)} min`:`${Math.round(-mins)} min ago`)}}
+  const score=clip(.6*Math.tanh(calSum)+.4*sent,-1,1);
+  return{score,outlook:score>.2?"BULLISH":score<-.2?"BEARISH":"NEUTRAL",today,heads:sc.slice(0,2).map(x=>[x[1],x[2]]),block,reason,status:NW.status}}
+function newsHtml(nw){
+  if(!nw)return`<div class="c s">News not loaded</div>`;
+  const c=nw.outlook=="BULLISH"?"var(--g)":nw.outlook=="BEARISH"?"var(--r)":"var(--y)";
+  let h=`<div class="c"><div class="l">NEWS</div><div class="v" style="color:${c};margin:6px 0">Gold outlook: ${nw.outlook} (${nw.score>0?"+":""}${nw.score.toFixed(2)})</div>`;
+  if(nw.block)h+=`<div style="color:var(--r)">⛔ ${nw.reason} — no new orders</div>`;
+  for(const x of nw.today.slice(0,4)){const k=x.s>.05?"var(--g)":x.s<-.05?"var(--r)":"var(--y)";
+    h+=`<div style="color:${k};font-size:12px;margin-top:6px">${x.time} ${x.title} · ${x.s>.05?"▲ gold":x.s<-.05?"▼ gold":"◆ volatile"}${x.mins<-15?" ✓":""}</div><div class="ev">forecast ${x.fc||"-"} / previous ${x.prev||"-"}</div>`}
+  if(!nw.today.length)h+=`<div class="ev">No red USD news today</div>`;
+  for(const[t,s]of nw.heads)h+=`<div style="color:${col(s)};font-size:11px;margin-top:6px">${s>0?"▲":"▼"} ${t.slice(0,60)}</div>`;
+  return h+`<div class="ev">headlines: ${nw.status}</div></div>`}
+
+/* ---------- UI ---------- */
+const col=s=>s>.15?"var(--g)":s<-.15?"var(--r)":"var(--y)";
+function render(S){
+  const{dec,tfs,price}=S,o=st.o,s=st.stats,sc=Math.round(Math.min(Math.abs(dec.total)/.6,1)*100);
+  let h=`<div class="c"><div class="s">XAUUSD · ${price.toFixed(2)} · ${S.stale?"MARKET CLOSED":"LIVE"}</div>`;
+  if(o){const p=o.plan,c=p.d>0?"buy":"sell",age=Math.max(0,MAXP-Math.floor((Date.now()-o.created)/60000));
+    h+=`<div class="big ${c}">${p.side}</div><div class="s">R:R 1:${TP_R[1]} · score ${Math.round(Math.min(Math.abs(o.score)/.6,1)*100)}/100 · ${p.why}</div>
+    <div class="t">${o.status=="PENDING"?`⏳ LIMIT PENDING · expires in ${age} min`:`✅ FILLED · ${o.hit}/3 TP hit`}</div>
+    <div class="row" style="margin-top:12px"><span class="l">ENTRY</span><span class="v" style="color:var(--p)">${p.entry.toFixed(2)}</span></div>
+    <div class="row"><span class="l">STOP LOSS${o.hit?" (BE)":""}</span><span class="v" style="color:var(--r)">${p.sl.toFixed(2)}</span></div>`+
+    p.tps.map((t,k)=>`<div class="tp ${o.hit>k?"hit":""}"><span>TP${k+1} · 1:${TP_R[k]}</span><b style="color:var(--g)">${t.toFixed(2)}${o.hit>k?" ✔":""}</b></div>`).join("");
+    if(o.status=="FILLED")h+=`<div class="s">Open P/L: ${(o.real+o.rem*p.d*(price-p.entry)/p.risk).toFixed(2)} R</div>`}
+  else{h+=`<div class="big wait">WAIT</div><div class="s">${dec.ok?"No valid entry level yet":"No valid setup (lean "+(dec.d>0?"bullish":"bearish")+")"} · score ${sc}/100</div>`+
+    dec.reasons.map(r=>`<div class="s" style="color:var(--y)">• ${r}</div>`).join("")}
+  h+=`</div><div class="c"><table><tr><th>Score</th><th>H4</th><th>H1</th><th>M15</th></tr><tr><td>Total</td>`+
+    ["H4","H1","M15"].map(k=>`<td style="color:${col(tfs[k].total)}">${tfs[k].total>0?"+":""}${tfs[k].total.toFixed(2)}</td>`).join("")+
+    `</tr></table><div class="s" style="text-align:left;margin-top:8px">Weighted ${dec.total.toFixed(3)} · aligned ${dec.aligned}/3</div></div>
+    ${newsHtml(S.nw)}<div class="c"><div class="s" style="text-align:left">Closed ${s.total} · Win ${s.wins} · Loss ${s.losses} · Cancelled ${s.cancelled}<br>Win-rate ${s.total?Math.round(s.wins/s.total*100):0}% · Net <b style="color:${s.net>=0?"var(--g)":"var(--r)"}">${s.net.toFixed(2)} R</b></div>
+    <div class="ev">${st.ev.slice().reverse().join("<br>")||"—"}</div><button onclick="if(confirm('Reset all data?')){localStorage.removeItem(KEY);location.reload()}">Reset</button></div>
+    <div class="s">Paper trading only · not financial advice · auto-refresh 15s</div>`;
+  document.getElementById("app").outerHTML=`<div id="app">${h}</div>`}
+async function tick(){
+  try{const data=await feed(),tfs={};for(const k in data)tfs[k]=analyze(data[k]);
+    const m15=data.M15,price=m15.at(-1).c,stale=Date.now()-m15.at(-1).t>STALE*60000;
+    const nw=await news().catch(()=>null),dec=decide(tfs,stale,nw),pl=dec.ok?buildPlan(dec,tfs,price):null;
+    update(price,dec,pl,stale,m15);render({dec,tfs,price,stale,nw})}
+  catch(e){document.getElementById("app").innerHTML=`<div class="c s">⚠ ${e.message}<br>Make sure the Netlify function is deployed.</div>`}}
+tick();setInterval(tick,15000);
+</script></body></html>
